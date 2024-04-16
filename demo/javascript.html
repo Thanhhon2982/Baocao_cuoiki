@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Secure Remote Password (SRP) </title>
+</head>
+<script language="JavaScript" type="text/javascript" src="sha1.js"></script>
+<script language="JavaScript" type="text/javascript" src="BigInteger.min.js"></script>
+<script language="JavaScript" type="text/javascript" src="bigint.js"></script>
+<script language="JavaScript">
+
+  var initialized = 0;
+  var N = null;
+  var g = null;
+  var salt = null;
+  var x = null;
+  var x2 = null;
+  var v = null;
+  var a = null;
+  var b = null;
+  var A = null;
+  var B = null;
+  var u = null;
+  var k = null;
+  var Sc = null;
+  var Ss = null;
+  var status_string = "Chờ ...";
+  var one;
+  var two;
+  var three;
+  var radix;
+  var proto;  
+
+  /* The no-radix form uses the radix that is "in effect" for the whole page */
+  function str2BigInt(str) {
+    return parseBigInt(str, radix);
+  }
+
+  function bigInt2Str(bi) {
+    return bigInt2radix(bi, radix);
+  }
+
+  /* Returns a string with n zeroes in it */
+  function nzero(n) {
+    if (n < 1) {
+      return "";
+    }
+    var t = nzero(n >> 1);
+    if ((n & 1) == 0) {
+      return t + t;
+    }
+    else {
+      return t + t + "0";
+    }
+  }
+
+
+
+  /* x = H(salt || H(username || ":" || password)) */
+  function srp_compute_x(u, p, s) {
+    // Inner hash: SHA-1(username || ":" || password)
+    var ih = calcSHA1(u + ":" + p);
+    // Outer hash: SHA-1(salt || inner_hash)
+    // This assumes that the hex salt string has an even number of characters...
+    var oh = calcSHA1Hex(bigInt2radix(s, 16) + ih);
+    var xtmp = parseBigInt(oh, 16);
+    if (xtmp.compareTo(N) < 0) {
+      return xtmp;
+    }
+    else {
+      return xtmp.mod(N.subtract(one));
+    }
+  }
+
+  /*
+   * SRP-3: u = first 32 bits (MSB) of SHA-1(B)
+   * SRP-6(a): u = SHA-1(A || B)
+   */
+  function srp_compute_u(Nv, av, bv) {
+    var ahex;
+    var bhex = String(bigInt2radix(bv, 16));
+    var hashin = "";
+    var utmp;
+    var nlen;
+    if (proto != "3") {
+      ahex = String(bigInt2radix(av, 16));
+      if (proto == "6") {
+        if ((ahex.length & 1) == 0) {
+          hashin += ahex;
+        }
+        else {
+          hashin += "0" + ahex;
+        }
+      }
+      else { /* 6a requires left-padding */
+        Nv.bitLength = function () {
+          return this.toString(2).length;
+        };
+        nlen = 2 * ((Nv.bitLength() + 7) >> 3);
+        hashin += nzero(nlen - ahex.length) + ahex;
+      }
+    }
+    if (proto == "3" || proto == "6") {
+      if ((bhex.length & 1) == 0) {
+        hashin += bhex;
+      }
+      else {
+        hashin += "0" + bhex;
+      }
+    }
+    else { /* 6a requires left-padding; nlen already set above */
+      hashin += nzero(nlen - bhex.length) + bhex;
+    }
+    if (proto == "3") {
+      utmp = parseBigInt(calcSHA1Hex(hashin).substr(0, 8), 16);
+    }
+    else {
+      utmp = parseBigInt(calcSHA1Hex(hashin), 16);
+    }
+    if (utmp.compareTo(Nv) < 0) {
+      return utmp;
+    }
+    else {
+      return utmp.mod(Nv.subtract(one));
+    }
+  }
+
+  function srp_compute_k(NN, gg) {
+    var hashin = "";
+    var nhex;
+    var ghex;
+    var ktmp;
+    if (proto == "3")
+      return one;
+    else if (proto == "6")
+      return three;
+    else {
+      /* SRP-6a: k = H(N || g) */
+      nhex = String(bigInt2radix(NN, 16));
+      if ((nhex.length & 1) == 0) {
+        hashin += nhex;
+      }
+      else {
+        hashin += "0" + nhex;
+      }
+      ghex = String(bigInt2radix(gg, 16));
+      hashin += nzero(nhex.length - ghex.length);
+      hashin += ghex;
+      ktmp = parseBigInt(calcSHA1Hex(hashin), 16);
+      if (ktmp.compareTo(NN) < 0) {
+        return ktmp;
+      }
+      else {
+        return ktmp.mod(NN);
+      }
+    }
+  }
+
+  /* S = (B - kg^x) ^ (a + ux) (mod N) */
+  function srp_compute_client_S(BB, xx, uu, aa, kk) {
+    var bx = g.modPow(xx, N);
+    var btmp = BB.add(N.multiply(kk)).subtract(bx.multiply(kk)).mod(N);
+    return btmp.modPow(xx.multiply(uu).add(aa), N);
+  }
+
+  /* S = (Av^u) ^ b (mod N) */
+  function srp_compute_server_S(AA, vv, uu, bb) {
+    return vv.modPow(uu, N).multiply(A).mod(N).modPow(bb, N);
+  }
+
+
+
+
+
+
+  /*
+   * isync_* methods: Synchronize internal state from form contents.
+   */
+
+  function isync_radix() {
+    if (document.srpform.radixb[0].checked) {
+      radix = 10;
+    }
+    else if (document.srpform.radixb[2].checked) {
+      radix = 64;
+    }
+    else {
+      radix = 16;
+    }
+  }
+
+  function isync_proto() {
+    if (document.srpform.protob[0].checked) {
+      proto = "3";
+    }
+    else if (document.srpform.protob[1].checked) {
+      proto = "6";
+    }
+    else {
+      proto = "6a";
+    }
+  }
+
+  function isync_params() {
+    var pstr = document.srpform.params.options[document.srpform.params.selectedIndex].value;
+    var si = pstr.indexOf(":");
+    N = parseBigInt(pstr.substr(0, si), 16);
+    g = parseBigInt(pstr.substr(si + 1), 16);
+    osync_g();
+    osync_N();
+  }
+
+  function isync_N() { N = str2BigInt(document.srpform.srp_N.value); }
+  function isync_g() { g = str2BigInt(document.srpform.srp_g.value); }
+  function isync_k() { k = str2BigInt(document.srpform.srp_k.value); }
+  function isync_salt() { salt = str2BigInt(document.srpform.srp_salt.value); }
+  function isync_x() { x = str2BigInt(document.srpform.srp_x.value); }
+  function isync_x2() { x2 = str2BigInt(document.srpform.srp_x2.value); }
+  function isync_v() { v = str2BigInt(document.srpform.srp_v.value); }
+  function isync_v2() { v = str2BigInt(document.srpform.srp_v2.value); }
+  function isync_a() { a = str2BigInt(document.srpform.srp_a.value); }
+  function isync_b() { b = str2BigInt(document.srpform.srp_b.value); }
+  function isync_A() { A = str2BigInt(document.srpform.srp_A.value); }
+  function isync_B() { B = str2BigInt(document.srpform.srp_B.value); }
+  function isync_u() { u = str2BigInt(document.srpform.srp_u.value); }
+  function isync_Sc() { Sc = str2BigInt(document.srpform.srp_Sc.value); }
+  function isync_Ss() { Ss = str2BigInt(document.srpform.srp_Ss.value); }
+  function isync_status() { status_string = document.srpform.srp_status.value; }
+
+  /*
+   * osync_* methods: Update form contents from internal state.
+   */
+  function osync_N() { document.srpform.srp_N.value = bigInt2Str(N); }
+  function osync_g() { document.srpform.srp_g.value = bigInt2Str(g); }
+  function osync_k() { document.srpform.srp_k.value = bigInt2Str(k); }
+  function osync_salt() { document.srpform.srp_salt.value = bigInt2Str(salt); }
+  function osync_x() { document.srpform.srp_x.value = bigInt2Str(x); }
+  function osync_x2() { document.srpform.srp_x2.value = bigInt2Str(x2); }
+  function osync_v() { document.srpform.srp_v.value = bigInt2Str(v); }
+  function osync_v2() { document.srpform.srp_v2.value = bigInt2Str(v); }
+  function osync_a() { document.srpform.srp_a.value = bigInt2Str(a); }
+  function osync_b() { document.srpform.srp_b.value = bigInt2Str(b); }
+  function osync_A() { document.srpform.srp_A.value = bigInt2Str(A); }
+  function osync_B() { document.srpform.srp_B.value = bigInt2Str(B); }
+  function osync_u() { document.srpform.srp_u.value = bigInt2Str(u); }
+  function osync_Sc() { document.srpform.srp_Sc.value = bigInt2Str(Sc); }
+  function osync_Ss() { document.srpform.srp_Ss.value = bigInt2Str(Ss); }
+  function osync_status() { document.srpform.srp_status.value = status_string; }
+
+  /*
+   * Recalculation primitives: Recompute the internal state of a field,
+   * possibly based on changed values of other fields, and display the
+   * updated value in the form field value, usually via an osync() call.
+   * These are "endpoint" function calls, and are NOT responsible for
+   * propagating changes to dependent fields.
+   */
+
+  function set_random_salt() {
+    salt = randomBigInt(10);
+    osync_salt();
+  }
+
+  function recalc_k() {
+    k = srp_compute_k(N, g);
+    osync_k();
+  }
+
+  function recalc_x() {
+    x = srp_compute_x(document.srpform.srp_username.value, document.srpform.srp_password.value, salt);
+    osync_x();
+  }
+
+  function recalc_x2() {
+    x2 = srp_compute_x(document.srpform.srp_username.value, document.srpform.srp_password2.value, salt);
+    osync_x2();
+  }
+
+  function recalc_v() {
+    v = g.modPow(x, N);
+    osync_v();
+    osync_v2();
+  }
+
+  function set_random_a() {
+    a = randomBigInt(32);
+    if (a.compareTo(N) >= 0) {
+      a = a.mod(N.subtract(one));
+    }
+    if (a.compareTo(two) < 0) {
+      a = two;
+    }
+    osync_a();
+  }
+
+  function set_random_b() {
+    b = randomBigInt(32);
+    if (b.compareTo(N) >= 0) {
+      b = b.mod(N.subtract(one));
+    }
+    if (b.compareTo(two) < 0) {
+      b = two;
+    }
+    osync_b();
+  }
+
+  function recalc_A() {
+    A = g.modPow(a, N);
+    osync_A();
+  }
+
+  function recalc_B() {
+    var bb = g.modPow(b, N);
+    B = bb.add(v.multiply(k)).mod(N);
+    osync_B();
+  }
+
+  function recalc_u() {
+    u = srp_compute_u(N, A, B);
+    osync_u();
+  }
+
+  function recalc_Sc() {
+    Sc = srp_compute_client_S(B, x2, u, a, k);
+    osync_Sc();
+  }
+
+  function recalc_Ss() {
+    Ss = srp_compute_server_S(A, v, u, b);
+    osync_Ss();
+  }
+
+  function recalc_status() {
+    if (Sc.compareTo(Ss) == 0) {
+      status_string = "Đăng nhập thành công";
+    }
+    else {
+      status_string = "Đăng nhập thất bại. Thử lại";
+    }
+    osync_status();
+  }
+
+
+
+  function update_params() {
+    recalc_k();
+    update_k();
+    recalc_x();
+    update_x();
+    recalc_x2();
+    update_x2();
+
+    recalc_A();
+    update_A();
+
+
+  }
+
+  function update_k() {
+    recalc_B();
+    update_B();
+  }
+
+  function update_salt() {
+    recalc_x();
+    update_x();
+    recalc_x2();
+    update_x2();
+  }
+
+  function update_username() {
+    recalc_x();
+    update_x();
+    recalc_x2();
+    update_x2();
+  }
+
+  function update_password() {
+    recalc_x();
+    update_x();
+  }
+
+  function update_password2() {
+
+    status_string = "Xác thực....";
+    osync_status();
+
+    recalc_x2();
+    update_x2();
+  }
+
+  function update_x() {
+    recalc_v();
+    update_v();
+  }
+
+  function update_x2() {
+    recalc_Sc();
+    update_Sc();
+  }
+
+  function update_v() {
+    recalc_B();
+    update_B();
+  }
+
+  function update_a() {
+    recalc_A();
+    update_A();
+    recalc_Sc();
+    update_Sc();
+  }
+
+  function update_b() {
+    recalc_B();
+    update_B();
+    recalc_Ss();
+    update_Ss();
+  }
+
+  function update_A() {
+    recalc_u();  // New for SRP-6
+    update_u();
+    recalc_Ss();
+    update_Ss();
+  }
+
+  function update_B() {
+    recalc_u();
+    update_u();
+    recalc_Sc();
+    update_Sc();
+  }
+
+  function update_u() {
+    recalc_Sc();
+    recalc_Ss();
+    update_Sc();
+    update_Ss();
+  }
+
+  function update_Sc() {
+    recalc_status();
+    update_status();
+  }
+
+  function update_Ss() {
+    recalc_status();
+    update_status();
+  }
+
+  function update_status() {
+  }
+
+  /*
+   * Event handlers: These are called directly as a result of some user
+   * action, like changing a form field or pushing a button.  These will
+   * usually call isync() to read in the field's new value, and then call
+   * the field's own update() to propagate changes.  Alternatively,
+   * the action might result in a new value computed internally, in which
+   * case the field is written out with osync() before update() is called.
+   */
+
+  function set_radix(r) {
+    radix = r;
+    /* Call osync() for all fields affected by a radix change */
+    osync_N();
+    osync_g();
+    osync_k();
+    osync_salt();
+    osync_x();
+    osync_x2();
+    osync_v();
+    osync_v2();
+    osync_a();
+    osync_b();
+    osync_A();
+    osync_B();
+    osync_u();
+    osync_Sc();
+    osync_Ss();
+  }
+
+  function set_proto(p) {
+    proto = p;
+    recalc_k();
+    update_k();
+    //recalc_B();
+    //update_B();
+    recalc_u();
+    update_u();
+    recalc_Sc();
+    update_Sc();
+  }
+
+  function change_N() {
+    isync_N();
+    if (srp_validate_N()) {
+      srp_validate_g();
+    }
+    update_params();
+  }
+
+  function change_g() {
+    isync_g();
+    srp_validate_g();
+    update_params();
+  }
+
+  function change_params() {
+    isync_params();
+    update_params();
+  }
+
+  function change_k() {
+    isync_k();
+    update_k();
+  }
+
+  function randomize_salt() {
+    set_random_salt();
+    update_salt();
+  }
+
+  function change_salt() {
+    isync_salt();
+    update_salt();
+  }
+
+  function change_username() {
+    update_username();
+  }
+
+  function change_password() {
+    update_password();
+  }
+
+  function change_password2() {
+    update_password2();
+  }
+
+  function change_x() {
+    isync_x();
+    update_x();
+  }
+
+  function change_x2() {
+    isync_x2();
+    update_x2();
+  }
+
+  function change_v() {
+    isync_v();
+    osync_v2(); // Update the other one, too
+    update_v();
+  }
+
+  function change_v2() {
+    isync_v2();
+    osync_v();  // Update the other one, too
+    update_v();
+  }
+
+  function randomize_a() {
+    set_random_a();
+    update_a();
+  }
+
+  function change_a() {
+    isync_a();
+    update_a();
+  }
+
+  function randomize_b() {
+    set_random_b();
+    update_b();
+  }
+
+  function change_b() {
+    isync_b();
+    update_b();
+  }
+
+  function change_A() {
+    isync_A();
+    update_A();
+  }
+
+  function change_B() {
+    isync_B();
+    update_B();
+  }
+
+  function change_u() {
+    isync_u();
+    update_u();
+  }
+
+  function change_Sc() {
+    isync_Sc();
+    update_Sc();
+  }
+
+  function change_Ss() {
+    isync_Ss();
+    update_Ss();
+  }
+
+  function srp_initialize() {
+    if (initialized > 0)
+      return;
+    one = parseBigInt("1", 16);
+    two = parseBigInt("2", 16);
+    three = parseBigInt("3", 16);
+    isync_radix();
+    isync_proto();
+    if (document.srpform.srp_N.value == "" || document.srpform.srp_g.value == "") {
+      isync_params();
+    }
+    else {
+      isync_N();
+      isync_g();
+    }
+    if (document.srpform.srp_salt.value == "") {
+      set_random_salt();
+    }
+    else {
+      isync_salt();
+    }
+    if (document.srpform.srp_a.value == "") {
+      set_random_a();
+    }
+    else {
+      isync_a();
+    }
+    if (document.srpform.srp_b.value == "") {
+      set_random_b();
+    }
+    else {
+      isync_b();
+    }
+    recalc_k();
+    recalc_x();
+    recalc_x2();
+    recalc_v();
+    recalc_A();
+    recalc_B();
+    recalc_u();
+    recalc_Sc();
+    recalc_Ss();
+    recalc_status();
+
+    document.srpform.srp_password2.focus();
+
+    initialized = 1;
+  }
+  //-->
+</script>
+
+<body bgcolor="#ffffff" text="#000000" onload="srp_initialize();">
+  <h1>Secure Remote Password (SRP) </h1>
+  <form name="srpform" onsubmit="change_password2()">
+
+    <b>1. Parameters</b>
+    <table border="0" cellspacing="0">
+      <tr>
+        <td align="right">Modulus (N) =</td>
+        <td><input name="srp_N" type="text" size="64" onchange="change_N();"></td>
+      </tr>
+      <tr>
+        <td align="right">Generator (g) =</td>
+        <td><input name="srp_g" type="text" size="64" onchange="change_g();"></td>
+      </tr>
+      <tr>
+
+      </tr>
+      <tr>
+        <td align="right"><i>Multiplier (k)</i> =</td>
+        <td><input name="srp_k" type="text" size="40" onchange="change_k();"></td>
+      </tr>
+    </table>
+    <hr>
+    <b>2. Password Database</b>
+    <p>Thiết lập trình xác minh mật khẩu của máy chủ. Mật khẩu mặc định là <b> 123123</b>
+    </p>
+    <table border="0" cellspacing="0">
+      <tr>
+        <td align="right"><b>Username:</b></td>
+        <td><input name="srp_username" type="text" value="nhom9" onchange="change_username();"></td>
+      </tr>
+      <tr>
+        <td align="right"><b>Password (server):</b></td>
+        <td><input name="srp_password" type="password" value="123123" onchange="change_password();"></td>
+      </tr>
+      <tr>
+        <td align="right">Salt (s) =</td>
+        <td><input name="srp_salt" type="text" size="20" onchange="change_salt();"><input type="button"
+            value="randomize" onclick="randomize_salt();"></td>
+      </tr>
+      <tr>
+        <td align="right"><i>x</i> =</td>
+        <td><i>H(s, password))</i></td>
+      </tr>
+      <tr>
+        <td align="right">=</td>
+        <td><input name="srp_x" type="text" size="40" onchange="change_x();"></td>
+      </tr>
+      <tr>
+        <td align="right"><i>Verifier (v)</i> =</td>
+        <td><i>g^x &nbsp; (mod N)</i></td>
+      </tr>
+      <tr>
+        <td align="right">=</td>
+        <td><input name="srp_v" type="text" size="64" onchange="change_v();"></td>
+      </tr>
+    </table>
+    <hr>
+    <b>3. Giao thức xác thực</b>
+    <p>Xác thực sẽ thành công nếu mật khẩu máy khách tương ứng với mục nhập xác minh của máy chủ (được đặt ở trên).
+    </p>
+    <table border="0" cellspacing="0">
+      <tr>
+        <td></td>
+        <td><b>Client</b></td>
+        <td>&nbsp</td>
+        <td></td>
+        <td><b>Server</b></td>
+      </tr>
+      <tr>
+        <td align="right">a=</td>
+        <td><input name="srp_a" type="text" size="32" onchange="change_a();"></td>
+        <td></td>
+        <td align="right">b=</td>
+        <td><input name="srp_b" type="text" size="32" onchange="change_b();"></td>
+      </tr>
+      <tr>
+        <td align="right"><i>A</i>=</td>
+        <td><i>g^a &nbsp; (mod N)</i></td>
+        <td></td>
+        <td align="right"><i>B</i>=</td>
+        <td><i>kv + g^b &nbsp; (mod N)</i></td>
+      </tr>
+      <tr>
+        <td align="right">=</td>
+        <td><input name="srp_A" type="text" size="48" onchange="change_A();"></td>
+        <td></td>
+        <td align="right">=</td>
+        <td><input name="srp_B" type="text" size="48" onchange="change_B();"></td>
+      </tr>
+      <tr>
+        <td align="right">
+          <font color="red"><b>Password (client):</b></font>
+        </td>
+        <td><input name="srp_password2" type="password" onchange="change_password2();"></td>
+        <td></td>
+        <td align="right"><i>u</i>=</td>
+        <td><input name="srp_u" type="text" size="40" onchange="change_u();"></td>
+      </tr>
+      <tr>
+        <td align="right"><i>x</i>=</td>
+        <td><input name="srp_x2" type="text" size="40" onchange="change_x2();"></td>
+        <td></td>
+        <td align="right"><i>v</i>=</td>
+        <td><input name="srp_v2" type="text" size="48" onchange="change_v2();"></td>
+      </tr>
+      <tr>
+        <td align="right"><i>S</i>=</td>
+        <td><i>(B - kg^x) ^ (a + ux) &nbsp; (mod N)</i></td>
+        <td></td>
+        <td align="right"><i>S</i>=</td>
+        <td><i>(Av^u) ^ b &nbsp; (mod N)</i></td>
+      </tr>
+      <tr>
+        <td align="right">=</td>
+        <td><input name="srp_Sc" type="text" size="48" onchange="change_Sc();"></td>
+        <td></td>
+        <td align="right">=</td>
+        <td><input name="srp_Ss" type="text" size="48" onchange="change_Ss();"></td>
+      </tr>
+    </table>
+    <hr>
+    Status: <input name="srp_status" type="text" value="Chờ..." size="40">
+    <button type="button" onclick="change_password2()">Kiểm tra đăng nhập</button>
+  </form>
+</body>
+
+</html>
